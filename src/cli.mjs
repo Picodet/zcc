@@ -5,9 +5,74 @@ import { spawnSync } from 'node:child_process';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const OFFICIAL_INSTALL_CMD = 'curl -fsSL https://claude.ai/install.sh | bash';
 const NPM_INSTALL_CMD = 'npm install -g @anthropic-ai/claude-code';
+
+/**
+ * 插件接口（预留）
+ * plugin = {
+ *   id: string,
+ *   phase: 4 | 5,
+ *   description: string,
+ *   run: async (context) => ({ status: 'ok'|'skipped'|'failed', message: string, details?: object })
+ * }
+ */
+const pluginRegistry = {
+  4: [],
+  5: [],
+};
+
+function registerPhasePlugin(phase, plugin) {
+  if (![4, 5].includes(phase)) {
+    throw new Error(`Unsupported phase: ${phase}`);
+  }
+  pluginRegistry[phase].push(plugin);
+}
+
+async function runPhasePlugins(phase, context) {
+  const plugins = pluginRegistry[phase] || [];
+  if (plugins.length === 0) {
+    return [{ id: 'none', status: 'skipped', message: '没有已注册插件' }];
+  }
+
+  const results = [];
+  for (const plugin of plugins) {
+    try {
+      const result = await plugin.run(context);
+      results.push({ id: plugin.id, ...result });
+    }
+    catch (error) {
+      results.push({
+        id: plugin.id,
+        status: 'failed',
+        message: error?.message || String(error),
+      });
+    }
+  }
+  return results;
+}
+
+// v0.1.x 仅做接口占位，不执行真实导入/飞书初始化
+registerPhasePlugin(4, {
+  id: 'skills-import-placeholder',
+  phase: 4,
+  description: 'Skills 导入插件接口占位',
+  run: async () => ({
+    status: 'skipped',
+    message: 'Phase 4 插件接口已就位，真实 skills 导入逻辑待接入。',
+  }),
+});
+
+registerPhasePlugin(5, {
+  id: 'feishu-bootstrap-placeholder',
+  phase: 5,
+  description: '飞书初始化插件接口占位',
+  run: async () => ({
+    status: 'skipped',
+    message: 'Phase 5 插件接口已就位，真实飞书初始化逻辑待接入。',
+  }),
+});
 
 function banner() {
   console.log('╔══════════════════════════════════════════════════════╗');
@@ -58,7 +123,7 @@ async function ask(rl, q) {
 }
 
 function phase0EnvironmentCheck() {
-  console.log('[1/3] 环境检查');
+  console.log('[1/5] 环境检查');
   const checks = [
     { name: 'bash', ok: commandExists('bash') },
     { name: 'curl', ok: commandExists('curl') },
@@ -96,7 +161,7 @@ function phase0EnvironmentCheck() {
 }
 
 async function phase1InstallClaude(rl, dryRun = false) {
-  console.log('[2/3] 安装 Claude Code');
+  console.log('[2/5] 安装 Claude Code');
   console.log('请选择 Claude Code 安装方式：');
   console.log('1. 官方推荐（curl 安装）');
   console.log('2. npm 安装（兼容模式 / 官方已弃用）');
@@ -135,7 +200,7 @@ async function phase1InstallClaude(rl, dryRun = false) {
 }
 
 async function phase2Config(rl) {
-  console.log('\n[3/3] 配置 API / 代理（最小配置）');
+  console.log('\n[3/5] 配置 API / 代理（最小配置）');
   console.log('支持三种模式：');
   console.log('- 官方账户 / 官方登录模式');
   console.log('- Anthropic API 模式');
@@ -199,14 +264,32 @@ async function phase2Config(rl) {
   return { ok: true, saved: true, path: written.join(', '), summary };
 }
 
-function printFinalSummary({ envResult, installResult, configResult }) {
+async function phase3RunPlugins(phase, context) {
+  const title = phase === 4 ? '[4/5] Skills 导入插件接口' : '[5/5] 飞书初始化插件接口';
+  console.log(`\n${title}`);
+  const results = await runPhasePlugins(phase, context);
+  results.forEach((r) => {
+    const icon = r.status === 'ok' ? '✅' : r.status === 'failed' ? '❌' : '⏭️';
+    console.log(`- ${icon} [${r.id}] ${r.message}`);
+  });
+  return results;
+}
+
+function summarizePluginResults(results = []) {
+  if (!results || results.length === 0) return '未执行';
+  if (results.some((r) => r.status === 'failed')) return '部分失败';
+  if (results.some((r) => r.status === 'ok')) return '已执行';
+  return '占位/已跳过';
+}
+
+function printFinalSummary({ envResult, installResult, configResult, phase4Results, phase5Results }) {
   console.log('\n════════════ 安装结果摘要 ════════════');
   console.log(`- Claude Code 安装方式: ${installResult.method}`);
   console.log(`- 当前安装位置: ${installResult.installPath}`);
   console.log(`- API 配置状态: ${configResult.saved ? '已保存' : '未保存'}`);
   console.log(`- API 配置文件: ${configResult.path}`);
-  console.log('- Skills 导入状态: 跳过（v1 暂不实现）');
-  console.log('- 飞书初始化状态: 跳过（v1 暂不实现）');
+  console.log(`- Skills 导入状态: ${summarizePluginResults(phase4Results)}`);
+  console.log(`- 飞书初始化状态: ${summarizePluginResults(phase5Results)}`);
   console.log('');
   console.log('下一步建议：');
   console.log('1) 运行 `claude --version` 验证安装');
@@ -235,7 +318,18 @@ async function runInstallFlow({ dryRun = false }) {
     }
 
     const configResult = await phase2Config(rl);
-    printFinalSummary({ envResult, installResult, configResult });
+
+    const context = {
+      dryRun,
+      envResult,
+      installResult,
+      configResult,
+      now: new Date().toISOString(),
+    };
+    const phase4Results = await phase3RunPlugins(4, context);
+    const phase5Results = await phase3RunPlugins(5, context);
+
+    printFinalSummary({ envResult, installResult, configResult, phase4Results, phase5Results });
   }
   finally {
     rl.close();
