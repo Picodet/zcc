@@ -5,7 +5,7 @@ Zero-Config Claude Bootstrap (Linux v1).
 ## 用法
 
 ```bash
-npx zcc install
+npx @picodet/zcc install
 ```
 
 第一版当前可用与预留：
