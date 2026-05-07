@@ -1,0 +1,53 @@
+node_modules
+dist
+.DS_Store
+*.log
+*.local
+.env
+.env.*
+!.env.example
+package-lock.json
+yarn.lock
+test.mjs
+
+# Test coverage reports
+coverage
+.nyc_output
+*.lcov
+.coverage
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea
+
+# Test artifacts
+*.test.tmp
+*.spec.tmp
+test-results
+junit.xml
+
+# Vitest
+.vitest-result.json
+
+# Test temporary output files
+*-output.txt
+
+# NPM integration test artifacts
+tmp-npm-test/
+*_test.log
+zh_test.log
+en_test.log
+zh_output.txt
+en_output.txt
+release_*_test.log
+test-*.js
+zcf-*.tgz
+
+# VitePress
+docs/.vitepress/cache/**
+
+# BMad Method V6
+_bmad/
+_bmad-output/
