@@ -6,13 +6,14 @@ import { spawnSync } from 'node:child_process';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
-const VERSION = '0.1.7';
+const VERSION = '0.1.8';
 const OFFICIAL_INSTALL_CMD = 'curl -fsSL https://claude.ai/install.sh | bash';
 const NPM_INSTALL_CMD = 'npm install -g @anthropic-ai/claude-code';
 const FEISHU_INSTALL_CMD = 'npx @larksuite/cli@latest install';
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGED_SKILLS_ZIP = path.resolve(MODULE_DIR, '../assets/paper_skills_zip.zip');
-const CLOUD_SKILLS_DIR = process.env.ZCC_CLOUD_SKILLS_DIR || path.join(os.homedir(), '.claude', 'skills');
+const DEFAULT_CLOUD_SKILLS_DIR = path.join(process.cwd(), '.claude', 'skills');
+const CLOUD_SKILLS_DIR = path.resolve(process.env.ZCC_CLOUD_SKILLS_DIR || DEFAULT_CLOUD_SKILLS_DIR);
 
 /**
  * 插件接口
@@ -84,6 +85,23 @@ function copyDirRecursive(srcDir, dstDir) {
   }
 }
 
+function displayPath(filePath) {
+  const resolved = path.resolve(filePath);
+  const relative = path.relative(process.cwd(), resolved);
+  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+    return `.${path.sep}${relative}`;
+  }
+  if (!relative) {
+    return '.';
+  }
+  return resolved;
+}
+
+function displayMaybePath(value) {
+  if (!value || value.startsWith('(')) return value || '(empty)';
+  return displayPath(value);
+}
+
 function listSkillDirs(rootDir) {
   const found = [];
 
@@ -106,6 +124,37 @@ function listSkillDirs(rootDir) {
     walk(rootDir);
   }
   return found;
+}
+
+function findExtractedSkillsRoot(extractDir) {
+  const directSkillsRoot = path.join(extractDir, 'skills');
+  if (fs.existsSync(directSkillsRoot) && fs.statSync(directSkillsRoot).isDirectory()) {
+    return directSkillsRoot;
+  }
+
+  const candidates = [];
+
+  function walk(current, depth = 0) {
+    if (depth > 3) return;
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+
+      const dir = path.join(current, entry.name);
+      if (entry.name === 'skills') {
+        candidates.push(dir);
+        continue;
+      }
+
+      walk(dir, depth + 1);
+    }
+  }
+
+  if (fs.existsSync(extractDir)) {
+    walk(extractDir);
+  }
+
+  return candidates[0] || null;
 }
 
 function writeFeishuInitSkillFile(skillsRootDir) {
@@ -138,7 +187,7 @@ function writeFeishuInitSkillFile(skillsRootDir) {
 registerPhasePlugin(4, {
   id: 'skills-import-package',
   phase: 4,
-  description: '解压并准备论文技能包到 Claude Cloud skills 目录，并追加“飞书初始化”技能提示词',
+  description: '解压包内技能包，并导入到当前项目的 .claude/skills 目录，同时追加“飞书初始化”技能提示词',
   run: async (context) => {
     const zccDir = path.join(os.homedir(), '.zcc');
     const skillsDir = CLOUD_SKILLS_DIR;
@@ -151,7 +200,7 @@ registerPhasePlugin(4, {
     const zipPath = zipCandidates.find((candidate) => fs.existsSync(candidate));
 
     const dryZipPath = zipPath || zipCandidates[0] || '(unknown)';
-    const dryMessage = `[dry-run] 将从 ${dryZipPath} 解压技能包到 ${skillsDir}，并写入“飞书初始化”技能文件。`;
+    const dryMessage = `[dry-run] 将从 ${displayMaybePath(dryZipPath)} 解压技能包，导入到 ${displayPath(skillsDir)}，并写入“飞书初始化”技能文件。`;
 
     if (context?.dryRun) {
       return {
@@ -168,7 +217,7 @@ registerPhasePlugin(4, {
     if (!zipPath) {
       return {
         status: 'failed',
-        message: `未找到技能包。已尝试路径：${zipCandidates.join(' | ')}`,
+        message: `未找到技能包。已尝试路径：${zipCandidates.map(displayMaybePath).join(' | ')}`,
       };
     }
 
@@ -192,32 +241,39 @@ registerPhasePlugin(4, {
       };
     }
 
-    const extractedSkillsRoot = path.join(extractDir, 'skills');
-    if (!fs.existsSync(extractedSkillsRoot)) {
+    const extractedSkillsRoot = findExtractedSkillsRoot(extractDir);
+    if (!extractedSkillsRoot) {
       return {
         status: 'failed',
-        message: `解压结果中未找到 skills 目录：${extractedSkillsRoot}`,
+        message: `解压结果中未找到 skills 目录：${displayPath(extractDir)}`,
       };
     }
 
-    const topEntries = fs.readdirSync(extractedSkillsRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name);
-
-    for (const entry of topEntries) {
-      copyDirRecursive(path.join(extractedSkillsRoot, entry), path.join(skillsDir, entry));
+    const sourceSkillDirs = listSkillDirs(extractedSkillsRoot);
+    if (sourceSkillDirs.length === 0) {
+      return {
+        status: 'failed',
+        message: `skills 目录中没有找到任何包含 SKILL.md 的技能目录：${displayPath(extractedSkillsRoot)}`,
+      };
     }
 
-    const importedSkillDirs = listSkillDirs(skillsDir)
-      .filter((dir) => dir.includes(`${path.sep}openclaw-main${path.sep}`));
+    const importedSkillDirs = [];
+    for (const sourceSkillDir of sourceSkillDirs) {
+      const skillName = path.basename(sourceSkillDir);
+      const targetSkillDir = path.join(skillsDir, skillName);
+      removeDirIfExists(targetSkillDir);
+      copyDirRecursive(sourceSkillDir, targetSkillDir);
+      importedSkillDirs.push(targetSkillDir);
+    }
 
     const feishu = writeFeishuInitSkillFile(skillsDir);
 
     return {
       status: 'ok',
-      message: `技能包已准备：${importedSkillDirs.length} 个技能目录 + “${feishu.skillName}”。`,
+      message: `技能包已导入到 ${displayPath(skillsDir)}：${importedSkillDirs.length} 个技能 + “${feishu.skillName}”。`,
       details: {
         zip_path: zipPath,
+        source_skills_root: extractedSkillsRoot,
         imported_count: importedSkillDirs.length,
         imported_sample: importedSkillDirs.slice(0, 5),
         skills_dir: skillsDir,
@@ -240,7 +296,7 @@ registerPhasePlugin(5, {
     if (context?.dryRun) {
       return {
         status: 'skipped',
-        message: `[dry-run] 将在 ${skillsDir} 执行：${FEISHU_INSTALL_CMD}。`,
+        message: `[dry-run] 将在 ${displayPath(skillsDir)} 执行：${FEISHU_INSTALL_CMD}。`,
         details: {
           command: FEISHU_INSTALL_CMD,
           cwd: skillsDir,
@@ -266,7 +322,7 @@ registerPhasePlugin(5, {
 
     return {
       status: 'ok',
-      message: `飞书 CLI 已安装。请在 cc 输入“飞书初始化”（文件：${feishu.skillPath}）。`,
+      message: `飞书 CLI 已安装。请在 cc 输入“飞书初始化”（文件：${displayPath(feishu.skillPath)}）。`,
       details: {
         command: FEISHU_INSTALL_CMD,
         cwd: skillsDir,
@@ -347,6 +403,7 @@ function phase0EnvironmentCheck() {
     { name: 'git', ok: commandExists('git') },
     { name: 'node', ok: commandExists('node') },
     { name: 'npm', ok: commandExists('npm') },
+    { name: 'unzip', ok: commandExists('unzip') },
   ];
 
   const isLinux = os.platform() === 'linux';
@@ -358,6 +415,7 @@ function phase0EnvironmentCheck() {
   checks.forEach((c) => console.log(`- ${c.name}: ${c.ok ? '✅' : '❌'}`));
   console.log(`- 当前 shell: ${shell}`);
   console.log(`- ~/.local/bin 在 PATH: ${inPath ? '✅' : '❌'}`);
+  console.log(`- Skills 目录: ${displayPath(CLOUD_SKILLS_DIR)}`);
 
   const missing = checks.filter((c) => !c.ok).map((c) => c.name);
   if (!isLinux || missing.length > 0) {
@@ -514,6 +572,7 @@ function printFinalSummary({ envResult, installResult, configResult, phase4Resul
   console.log(`- 当前安装位置: ${installResult.installPath}`);
   console.log(`- API 配置状态: ${configResult.saved ? '已保存' : '未保存'}`);
   console.log(`- API 配置文件: ${configResult.path}`);
+  console.log(`- Skills 目录: ${displayPath(CLOUD_SKILLS_DIR)}`);
   console.log(`- Skills 导入状态: ${summarizePluginResults(phase4Results)}`);
   console.log(`- 飞书初始化状态: ${summarizePluginResults(phase5Results)}`);
   console.log('');
