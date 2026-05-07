@@ -1,16 +1,21 @@
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
-const VERSION = '0.1.1';
+const VERSION = '0.1.7';
 const OFFICIAL_INSTALL_CMD = 'curl -fsSL https://claude.ai/install.sh | bash';
 const NPM_INSTALL_CMD = 'npm install -g @anthropic-ai/claude-code';
+const FEISHU_INSTALL_CMD = 'npx @larksuite/cli@latest install';
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGED_SKILLS_ZIP = path.resolve(MODULE_DIR, '../assets/paper_skills_zip.zip');
+const CLOUD_SKILLS_DIR = process.env.ZCC_CLOUD_SKILLS_DIR || path.join(os.homedir(), '.claude', 'skills');
 
 /**
- * 插件接口（预留）
+ * 插件接口
  * plugin = {
  *   id: string,
  *   phase: 4 | 5,
@@ -53,25 +58,223 @@ async function runPhasePlugins(phase, context) {
   return results;
 }
 
-// v0.1.x 仅做接口占位，不执行真实导入/飞书初始化
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function removeDirIfExists(dirPath) {
+  if (fs.existsSync(dirPath)) {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+  }
+}
+
+function copyDirRecursive(srcDir, dstDir) {
+  ensureDir(dstDir);
+  const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const src = path.join(srcDir, entry.name);
+    const dst = path.join(dstDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirRecursive(src, dst);
+    }
+    else {
+      ensureDir(path.dirname(dst));
+      fs.copyFileSync(src, dst);
+    }
+  }
+}
+
+function listSkillDirs(rootDir) {
+  const found = [];
+
+  function walk(current) {
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    const hasSkill = entries.some((entry) => entry.isFile() && entry.name === 'SKILL.md');
+    if (hasSkill) {
+      found.push(current);
+      return;
+    }
+
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        walk(path.join(current, entry.name));
+      }
+    }
+  }
+
+  if (fs.existsSync(rootDir)) {
+    walk(rootDir);
+  }
+  return found;
+}
+
+function writeFeishuInitSkillFile(skillsRootDir) {
+  const skillName = '飞书初始化';
+  const skillDir = path.join(skillsRootDir, skillName);
+  const skillPath = path.join(skillDir, 'SKILL.md');
+  const skillPrompt = '帮我安装飞书 CLI：https://open.feishu.cn/document/no_class/mcp-archive/feishu-cli-installation-guide.md';
+  const skillContent = [
+    '---',
+    `name: ${skillName}`,
+    'version: 1.0.0',
+    'description: 一键给出飞书 CLI 安装提示词。',
+    '---',
+    '',
+    '# 飞书初始化',
+    '',
+    '## 提示词',
+    skillPrompt,
+    '',
+    '## 用法',
+    '在 cc 中直接发送上面的提示词即可。',
+    '',
+  ].join('\n');
+
+  ensureDir(skillDir);
+  fs.writeFileSync(skillPath, skillContent, 'utf-8');
+  return { skillName, skillDir, skillPath, skillPrompt };
+}
+
 registerPhasePlugin(4, {
-  id: 'skills-import-placeholder',
+  id: 'skills-import-package',
   phase: 4,
-  description: 'Skills 导入插件接口占位',
-  run: async () => ({
-    status: 'skipped',
-    message: 'Phase 4 插件接口已就位，真实 skills 导入逻辑待接入。',
-  }),
+  description: '解压并准备论文技能包到 Claude Cloud skills 目录，并追加“飞书初始化”技能提示词',
+  run: async (context) => {
+    const zccDir = path.join(os.homedir(), '.zcc');
+    const skillsDir = CLOUD_SKILLS_DIR;
+    const cacheDir = path.join(zccDir, 'cache');
+    const extractDir = path.join(cacheDir, 'paper_skills_zip');
+    const zipCandidates = [
+      process.env.ZCC_SKILLS_ZIP,
+      PACKAGED_SKILLS_ZIP,
+    ].filter(Boolean);
+    const zipPath = zipCandidates.find((candidate) => fs.existsSync(candidate));
+
+    const dryZipPath = zipPath || zipCandidates[0] || '(unknown)';
+    const dryMessage = `[dry-run] 将从 ${dryZipPath} 解压技能包到 ${skillsDir}，并写入“飞书初始化”技能文件。`;
+
+    if (context?.dryRun) {
+      return {
+        status: 'skipped',
+        message: dryMessage,
+        details: {
+          zip_path: zipPath,
+          skills_dir: skillsDir,
+          feishu_skill: path.join(skillsDir, '飞书初始化', 'SKILL.md'),
+        },
+      };
+    }
+
+    if (!zipPath) {
+      return {
+        status: 'failed',
+        message: `未找到技能包。已尝试路径：${zipCandidates.join(' | ')}`,
+      };
+    }
+
+    if (!commandExists('unzip')) {
+      return {
+        status: 'failed',
+        message: '系统缺少 unzip 命令，无法解压技能包。',
+      };
+    }
+
+    ensureDir(cacheDir);
+    ensureDir(skillsDir);
+    removeDirIfExists(extractDir);
+    ensureDir(extractDir);
+
+    const unzipRes = run(`unzip -o "${zipPath}" -d "${extractDir}"`, false);
+    if (unzipRes.status !== 0) {
+      return {
+        status: 'failed',
+        message: `解压失败（退出码 ${unzipRes.status}）。`,
+      };
+    }
+
+    const extractedSkillsRoot = path.join(extractDir, 'skills');
+    if (!fs.existsSync(extractedSkillsRoot)) {
+      return {
+        status: 'failed',
+        message: `解压结果中未找到 skills 目录：${extractedSkillsRoot}`,
+      };
+    }
+
+    const topEntries = fs.readdirSync(extractedSkillsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+
+    for (const entry of topEntries) {
+      copyDirRecursive(path.join(extractedSkillsRoot, entry), path.join(skillsDir, entry));
+    }
+
+    const importedSkillDirs = listSkillDirs(skillsDir)
+      .filter((dir) => dir.includes(`${path.sep}openclaw-main${path.sep}`));
+
+    const feishu = writeFeishuInitSkillFile(skillsDir);
+
+    return {
+      status: 'ok',
+      message: `技能包已准备：${importedSkillDirs.length} 个技能目录 + “${feishu.skillName}”。`,
+      details: {
+        zip_path: zipPath,
+        imported_count: importedSkillDirs.length,
+        imported_sample: importedSkillDirs.slice(0, 5),
+        skills_dir: skillsDir,
+        feishu_skill_path: feishu.skillPath,
+      },
+    };
+  },
 });
 
 registerPhasePlugin(5, {
-  id: 'feishu-bootstrap-placeholder',
+  id: 'feishu-bootstrap',
   phase: 5,
-  description: '飞书初始化插件接口占位',
-  run: async () => ({
-    status: 'skipped',
-    message: 'Phase 5 插件接口已就位，真实飞书初始化逻辑待接入。',
-  }),
+  description: '安装飞书 CLI，并提醒用户在 cc 使用“飞书初始化”提示词',
+  run: async (context) => {
+    const skillsDir = CLOUD_SKILLS_DIR;
+    ensureDir(skillsDir);
+
+    const feishu = writeFeishuInitSkillFile(skillsDir);
+
+    if (context?.dryRun) {
+      return {
+        status: 'skipped',
+        message: `[dry-run] 将在 ${skillsDir} 执行：${FEISHU_INSTALL_CMD}。`,
+        details: {
+          command: FEISHU_INSTALL_CMD,
+          cwd: skillsDir,
+          skill_name: feishu.skillName,
+          skill_path: feishu.skillPath,
+          prompt: feishu.skillPrompt,
+        },
+      };
+    }
+
+    const installRes = run(FEISHU_INSTALL_CMD, false, { cwd: skillsDir });
+    if (installRes.status !== 0) {
+      return {
+        status: 'failed',
+        message: `飞书 CLI 安装失败（退出码 ${installRes.status}）。`,
+        details: {
+          command: FEISHU_INSTALL_CMD,
+          cwd: skillsDir,
+          skill_path: feishu.skillPath,
+        },
+      };
+    }
+
+    return {
+      status: 'ok',
+      message: `飞书 CLI 已安装。请在 cc 输入“飞书初始化”（文件：${feishu.skillPath}）。`,
+      details: {
+        command: FEISHU_INSTALL_CMD,
+        cwd: skillsDir,
+        skill_name: feishu.skillName,
+        skill_path: feishu.skillPath,
+      },
+    };
+  },
 });
 
 function banner() {
@@ -103,12 +306,22 @@ function commandExists(cmd) {
   return p.status === 0;
 }
 
-function run(command, dryRun = false) {
+function run(command, dryRun = false, options = {}) {
   if (dryRun) {
-    console.log(`🧪 [dry-run] ${command}`);
+    if (options.cwd) {
+      console.log(`🧪 [dry-run] (cd ${options.cwd} && ${command})`);
+    }
+    else {
+      console.log(`🧪 [dry-run] ${command}`);
+    }
     return { status: 0 };
   }
-  return spawnSync('bash', ['-lc', command], { stdio: 'inherit' });
+
+  const spawnOptions = {
+    stdio: 'inherit',
+    ...(options.cwd ? { cwd: options.cwd } : {}),
+  };
+  return spawnSync('bash', ['-lc', command], spawnOptions);
 }
 
 function maskSecret(key = '') {
@@ -120,6 +333,10 @@ function maskSecret(key = '') {
 async function ask(rl, q) {
   const ans = await rl.question(q);
   return ans.trim();
+}
+
+function isValidConfigName(name) {
+  return /^[A-Za-z0-9 ._-]+$/.test(name);
 }
 
 function phase0EnvironmentCheck() {
@@ -201,18 +418,23 @@ async function phase1InstallClaude(rl, dryRun = false) {
 
 async function phase2Config(rl) {
   console.log('\n[3/5] 配置 API / 代理（最小配置）');
-  console.log('支持三种模式：');
-  console.log('- 官方账户 / 官方登录模式');
-  console.log('- Anthropic API 模式');
-  console.log('- 兼容代理 / Router / 中转模式');
-  console.log('');
+  console.log('示例：GLM CN / OpenRouter / Anthropic API');
 
+  let profileName = await ask(rl, '配置名称（仅限字母、数字、空格、._-，默认 GLM CN）: ');
+  if (!profileName) profileName = 'GLM CN';
+  while (!isValidConfigName(profileName)) {
+    profileName = await ask(rl, '名称不合法，请重新输入（仅限字母、数字、空格、._-）: ');
+    if (!profileName) profileName = 'GLM CN';
+  }
+
+  console.log(`编辑配置：${profileName}`);
   const mode = await ask(rl, '选择模式 [official/api/router] (默认 api): ') || 'api';
-  const baseUrl = await ask(rl, 'Base URL (可空): ');
-  const apiKey = await ask(rl, 'API Key (可空): ');
+  const baseUrl = await ask(rl, '请输入 API 基础 URL（默认 https://open.bigmodel.cn/api/anthropic）: ') || 'https://open.bigmodel.cn/api/anthropic';
+  const apiKey = await ask(rl, '请输入 API 密钥（可空，建议后续手动填入 .env.zcc）: ');
   const model = await ask(rl, 'Model (可空): ');
 
   const summary = {
+    profileName,
     mode,
     baseUrl: baseUrl || '(empty)',
     apiKeyMasked: maskSecret(apiKey),
@@ -220,6 +442,7 @@ async function phase2Config(rl) {
   };
 
   console.log('\n配置摘要：');
+  console.log(`- profile: ${summary.profileName}`);
   console.log(`- mode: ${summary.mode}`);
   console.log(`- base_url: ${summary.baseUrl}`);
   console.log(`- api_key: ${summary.apiKeyMasked}`);
@@ -231,11 +454,11 @@ async function phase2Config(rl) {
   }
 
   const target = (await ask(rl, '保存格式 [1=config.json, 2=.env.zcc, 3=both] (默认1): ')) || '1';
-  const home = os.homedir();
-  const zccDir = path.join(home, '.zcc');
-  fs.mkdirSync(zccDir, { recursive: true });
+  const zccDir = path.join(os.homedir(), '.zcc');
+  ensureDir(zccDir);
 
   const config = {
+    profile_name: profileName,
     mode,
     base_url: baseUrl || '',
     api_key: apiKey || '',
@@ -249,12 +472,15 @@ async function phase2Config(rl) {
     fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
     written.push(configPath);
   }
+
   if (target === '2' || target === '3') {
     const envPath = path.join(zccDir, '.env.zcc');
     const envText = [
+      '# ZCC API 配置（请手动填写 ZCC_API_KEY）',
+      `ZCC_PROFILE_NAME=${profileName}`,
       `ZCC_MODE=${mode}`,
       `ZCC_BASE_URL=${baseUrl}`,
-      `ZCC_API_KEY=${apiKey}`,
+      'ZCC_API_KEY=',
       `ZCC_MODEL=${model}`,
     ].join('\n') + '\n';
     fs.writeFileSync(envPath, envText, 'utf-8');
@@ -265,7 +491,7 @@ async function phase2Config(rl) {
 }
 
 async function phase3RunPlugins(phase, context) {
-  const title = phase === 4 ? '[4/5] Skills 导入插件接口' : '[5/5] 飞书初始化插件接口';
+  const title = phase === 4 ? '[4/5] Skills 导入' : '[5/5] 飞书初始化';
   console.log(`\n${title}`);
   const results = await runPhasePlugins(phase, context);
   results.forEach((r) => {
@@ -326,10 +552,35 @@ async function runInstallFlow({ dryRun = false }) {
       configResult,
       now: new Date().toISOString(),
     };
+
     const phase4Results = await phase3RunPlugins(4, context);
     const phase5Results = await phase3RunPlugins(5, context);
 
     printFinalSummary({ envResult, installResult, configResult, phase4Results, phase5Results });
+  }
+  finally {
+    rl.close();
+  }
+}
+
+async function runInteractiveMenu() {
+  banner();
+  usage();
+
+  const rl = readline.createInterface({ input, output });
+  try {
+    const choice = (await ask(rl, '请输入选项 [1/Q]: ')).toUpperCase();
+    if (choice === '1') {
+      await runInstallFlow({ dryRun: false });
+      return;
+    }
+    if (choice === 'Q' || choice === '') {
+      return;
+    }
+
+    console.log(`未知选项: ${choice}`);
+    console.log('请重新执行并输入 1 或 Q。');
+    process.exitCode = 1;
   }
   finally {
     rl.close();
@@ -342,8 +593,7 @@ async function main() {
   const dryRun = args.includes('--dry-run');
 
   if (!cmd) {
-    banner();
-    usage();
+    await runInteractiveMenu();
     return;
   }
 
